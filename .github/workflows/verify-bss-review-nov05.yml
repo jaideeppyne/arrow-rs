@@ -1,0 +1,113 @@
+name: Verify byte stream split review
+on:
+  push:
+    branches: [verify/bss-review-nov05]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+      - name: Toolchain
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal --component rustfmt,clippy
+          rustup override set 1.99.1
+      - name: Write standalone public-API reproducer
+        run: |
+          mkdir -p proof
+          cat > parquet/examples/bss-review-repro.rs <<'RUST'
+          use std::sync::Arc;
+          use arrow_array::{ArrayRef, Float64Array, RecordBatch};
+          use arrow_schema::{DataType, Field, Schema};
+          use bytes::Bytes;
+          use parquet::arrow::{ArrowWriter, arrow_reader::ParquetRecordBatchReaderBuilder};
+          use parquet::basic::{Compression, Encoding};
+          use parquet::errors::ParquetError;
+          use parquet::file::{properties::{WriterProperties, WriterVersion}, reader::{FileReader, SerializedFileReader}};
+          
+          fn read(data: Bytes) -> Result<usize, ParquetError> {
+              let reader = ParquetRecordBatchReaderBuilder::try_new(data)?.build()?;
+              let mut rows = 0;
+              for batch in reader { rows += batch?.num_rows(); }
+              Ok(rows)
+          }
+          
+          fn main() {
+              let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Float64, false)]));
+              let values: ArrayRef = Arc::new(Float64Array::from_iter_values((0..8).map(|i| f64::from(i) + 0.5)));
+              let batch = RecordBatch::try_new(schema.clone(), vec![values]).unwrap();
+              let props = WriterProperties::builder()
+                  .set_writer_version(WriterVersion::PARQUET_2_0)
+                  .set_dictionary_enabled(false)
+                  .set_compression(Compression::UNCOMPRESSED)
+                  .set_encoding(Encoding::BYTE_STREAM_SPLIT).build();
+              let mut raw = Vec::new();
+              let mut writer = ArrowWriter::try_new(&mut raw, schema, Some(props)).unwrap();
+              writer.write(&batch).unwrap();
+              writer.close().unwrap();
+              let original = Bytes::from(raw);
+              assert_eq!(read(original.clone()).unwrap(), 8);
+              let file = SerializedFileReader::new(original.clone()).unwrap();
+              let (offset, length) = file.metadata().row_group(0).column(0).byte_range();
+              let offset = offset as usize;
+              let field = original[offset..offset + length as usize].windows(2)
+                  .position(|pair| pair == [0x15, 16]).unwrap();
+              let mut bad = original.to_vec();
+              bad[offset + field + 1] = 126;
+              std::fs::write("proof/valid-bss.parquet", &original).unwrap();
+              std::fs::write("proof/malformed-bss.parquet", &bad).unwrap();
+              println!("valid: 8 rows; changed byte {} from 16 to 126; file size {} unchanged", offset + field + 1, bad.len());
+              let result = std::panic::catch_unwind(|| read(Bytes::from(bad)));
+              if std::env::var_os("BSS_EXPECT_PANIC").is_some() {
+                  assert!(result.is_err(), "baseline did not panic: {result:?}");
+                  println!("baseline: observed the out-of-bounds panic through the public Parquet reader");
+              } else {
+                  let error = result.expect("reader must not panic").unwrap_err();
+                  assert!(error.to_string().contains("insufficient values read from column"), "{error}");
+                  println!("fixed: {error}");
+              }
+          }
+          RUST
+          cp parquet/examples/bss-review-repro.rs proof/reproduce.rs
+      - name: Reproduce panic against unchanged upstream
+        run: |
+          for path in parquet/src/encodings/decoding/byte_stream_split_decoder.rs parquet/src/column/reader/decoder.rs; do
+            git show 32902415b841ac824470d8ee9ffd4b785d8b2a9a:$path > "$path"
+          done
+          BSS_EXPECT_PANIC=1 cargo run -p parquet --example bss-review-repro 2>&1 | tee proof/baseline-repro.log
+          sha256sum proof/*.parquet > proof/baseline-fixtures.sha256
+          set +e
+          cargo test -p parquet --test arrow_reader test_byte_stream_split_truncated_page -- --nocapture > proof/baseline-test.log 2>&1
+          result=$?
+          set -e
+          test "$result" -ne 0
+          grep -q 'index out of bounds' proof/baseline-test.log
+          for path in parquet/src/encodings/decoding/byte_stream_split_decoder.rs parquet/src/column/reader/decoder.rs; do
+            git show b280e76f20fb9865e1657a412ceaf049e184eb88:$path > "$path"
+          done
+      - name: Fixed public reader and full Parquet tests
+        run: |
+          cargo run -p parquet --example bss-review-repro 2>&1 | tee proof/fixed-repro.log
+          sha256sum --check proof/baseline-fixtures.sha256
+          rm parquet/examples/bss-review-repro.rs
+          cargo test -p parquet --lib --locked 2>&1 | tee proof/parquet-unit.log
+          cargo test -p parquet --test arrow_reader --locked 2>&1 | tee proof/arrow-reader.log
+          cargo clippy -p parquet --all-targets --all-features --locked -- -D warnings 2>&1 | tee proof/clippy.log
+          cargo +stable fmt --all -- --check
+          git diff --exit-code
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bss-review-proof
+          path: proof
